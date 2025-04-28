@@ -1,58 +1,53 @@
 use std::{future::Future, mem, pin, sync, task};
 /// [async_task::spawn]
-pub fn spawn<F, S>(future: F, schedule: S) -> Task<F, S>
+pub fn spawn<T>(
+    future: impl Future<Output = T> + Send + Sync + 'static,
+    schedule: impl Fn(sync::Arc<Runnable<T>>) + Send + Sync + 'static,
+) -> Task<T>
 where
-    F: Future + Send + Sync + 'static,
-    F::Output: Send + Sync + 'static,
-    S: Fn(sync::Arc<Runnable<F, S>>) + Send + Sync + 'static,
+    T: Send + Sync + 'static,
 {
     let runnable = sync::Arc::new(Runnable {
-        future: sync::Mutex::new(future),
-        schedule,
+        future: sync::Mutex::new(Box::pin(future)),
+        schedule: Box::new(schedule),
         state: sync::Mutex::new(State::Scheduled),
     });
     (runnable.schedule)(runnable.clone());
     Task { runnable }
 }
 /// [async_task::Runnable]
-pub struct Runnable<F, S>
+pub struct Runnable<T>
 where
-    F: Future + Send + Sync + 'static,
-    F::Output: Send + Sync + 'static,
-    S: Fn(sync::Arc<Runnable<F, S>>) + Send + Sync + 'static,
+    T: Send + Sync + 'static,
 {
-    future: sync::Mutex<F>,
-    schedule: S,
-    state: sync::Mutex<State<F::Output>>,
+    future: sync::Mutex<pin::Pin<Box<dyn Future<Output = T> + Send + Sync>>>,
+    schedule: Box<dyn Fn(sync::Arc<Runnable<T>>) + Send + Sync>,
+    state: sync::Mutex<State<T>>,
 }
-impl<F, S> Runnable<F, S>
+impl<T> Runnable<T>
 where
-    F: Future + Send + Sync + 'static,
-    F::Output: Send + Sync + 'static,
-    S: Fn(sync::Arc<Runnable<F, S>>) + Send + Sync + 'static,
+    T: Send + Sync + 'static,
 {
     /// [async_task::Runnable::run]
-    pub fn run(this: sync::Arc<Runnable<F, S>>) -> bool {
-        let waker = task::Waker::from(this.clone());
+    pub fn run(self: sync::Arc<Self>) -> bool {
+        let waker = task::Waker::from(self.clone());
         let mut cx = task::Context::from_waker(&waker);
-        let mut state = this.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         match *state {
             State::Completed(_) | State::Canceled => return false,
             _ => *state = State::Running,
         }
-        let mut future = this.future.lock().unwrap();
-        *state = match unsafe { pin::Pin::new_unchecked(&mut *future) }.poll(&mut cx) {
+        let mut future = self.future.lock().unwrap();
+        *state = match future.as_mut().poll(&mut cx) {
             task::Poll::Ready(output) => State::Completed(Some(output)),
             task::Poll::Pending => State::Pending,
         };
         false
     }
 }
-impl<F, S> task::Wake for Runnable<F, S>
+impl<T> task::Wake for Runnable<T>
 where
-    F: Future + Send + Sync + 'static,
-    F::Output: Send + Sync + 'static,
-    S: Fn(sync::Arc<Runnable<F, S>>) + Send + Sync + 'static,
+    T: Send + Sync + 'static,
 {
     fn wake(self: sync::Arc<Self>) {
         let mut state = self.state.lock().unwrap();
@@ -69,26 +64,22 @@ where
     }
 }
 /// [async_task::Task]
-pub struct Task<F, S>
+pub struct Task<T>
 where
-    F: Future + Send + Sync + 'static,
-    F::Output: Send + Sync + 'static,
-    S: Fn(sync::Arc<Runnable<F, S>>) + Send + Sync + 'static,
+    T: Send + Sync + 'static,
 {
-    runnable: sync::Arc<Runnable<F, S>>,
+    runnable: sync::Arc<Runnable<T>>,
 }
-impl<F, S> Task<F, S>
+impl<T> Task<T>
 where
-    F: Future + Send + Sync + 'static,
-    F::Output: Send + Sync + 'static,
-    S: Fn(sync::Arc<Runnable<F, S>>) + Send + Sync + 'static,
+    T: Send + Sync + 'static,
 {
     /// [async_task::Task::detach]
     pub fn detach(self) {
         mem::forget(self);
     }
     /// [async_task::Task::cancel]
-    pub async fn cancel(self) -> Option<F::Output> {
+    pub async fn cancel(self) -> Option<T> {
         let mut state = self.runnable.state.lock().unwrap();
         match *state {
             State::Completed(_) => {}
@@ -98,11 +89,9 @@ where
         self.await
     }
 }
-impl<F, S> Drop for Task<F, S>
+impl<T> Drop for Task<T>
 where
-    F: Future + Send + Sync + 'static,
-    F::Output: Send + Sync + 'static,
-    S: Fn(sync::Arc<Runnable<F, S>>) + Send + Sync + 'static,
+    T: Send + Sync + 'static,
 {
     fn drop(&mut self) {
         let mut state = self.runnable.state.lock().unwrap();
@@ -112,13 +101,11 @@ where
         }
     }
 }
-impl<F, S> Future for Task<F, S>
+impl<T> Future for Task<T>
 where
-    F: Future + Send + Sync + 'static,
-    F::Output: Send + Sync + 'static,
-    S: Fn(sync::Arc<Runnable<F, S>>) + Send + Sync + 'static,
+    T: Send + Sync + 'static,
 {
-    type Output = Option<F::Output>;
+    type Output = Option<T>;
     fn poll(self: pin::Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
         let waker = task::Waker::from(self.runnable.clone());
         let mut state = self.runnable.state.lock().unwrap();
