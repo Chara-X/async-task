@@ -106,8 +106,7 @@ where
     T: Send + Sync + 'static,
 {
     type Output = Option<T>;
-    fn poll(self: pin::Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
-        let waker = task::Waker::from(self.runnable.clone());
+    fn poll(self: pin::Pin<&mut Self>, _cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
         let mut state = self.runnable.state.lock().unwrap();
         match &mut *state {
             State::Completed(output) => task::Poll::Ready(output.take()),
